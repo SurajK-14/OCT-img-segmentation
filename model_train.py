@@ -1,0 +1,314 @@
+#!/usr/bin/env python
+
+# %% IMPORTS
+import os
+import re
+import torch
+import numpy as np
+from PIL import Image
+from pathlib import Path
+import matplotlib.pyplot as plt
+from datasets import Dataset, DatasetDict, Image
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_curve, auc, precision_recall_curve
+from transformers import AutoImageProcessor, TrainingArguments, Trainer, RTDetrV2ForObjectDetection, RTDetrImageProcessor
+import albumentations as A
+# from evaluate import load as load_metric
+
+# %% SESSION VARIABLES
+# Define paths
+base_dir    = "/home/suraj/Data/Duke_WLOA_RL_Annotated/AMD/output"
+image_dir   = os.path.join(base_dir, "image")
+mask_dir    = os.path.join(base_dir, "layer")
+output_dir  = "./segformer-oct"
+
+# %% FUNCTIONS 
+def create_smaller_dataset(image_dir, mask_dir, target_size=5000, n_remove=15, 
+                           fovea_range=(40, 60), sample_step=3):
+    ''' 
+    Create smaller dataset
+    '''
+    # Step 1: Collect all valid files without deleting
+    files = [f for f in os.listdir(image_dir) if f.endswith('.png')]
+    patient_dict = {}
+    pattern = re.compile(r'(AMD_\d{3})_(\d{3})\.png')
+    for f in files:
+        m = pattern.match(f)
+        if m:
+            patient, idx = m.group(1), int(m.group(2))
+            if n_remove < idx <= (100 - n_remove):  # Exclude first and last n_remove
+                patient_dict.setdefault(patient, []).append((idx, f))
+    
+    # Step 2: Select ~18-20 images per patient
+    selected_images = []
+    selected_masks = []
+    images_per_patient = max(1, target_size // len(patient_dict))  # ~18-20 images per patient
+    
+    for patient, idx_files in patient_dict.items():
+        idx_files.sort()
+        patient_images = []
+        patient_masks = []
+        # Prioritize fovea-centered images (40-60)
+        fovea_images = [(idx, f) for idx, f in idx_files if fovea_range[0] <= idx <= fovea_range[1]]
+        # Sample remaining images to avoid redundancy
+        other_images = [(idx, f) for idx, f in idx_files if idx < fovea_range[0] or idx > fovea_range[1]]
+        sampled_images = other_images[::sample_step]
+        
+        # Combine and limit to images_per_patient
+        selected = fovea_images[:images_per_patient]
+        selected += sampled_images[:(images_per_patient - len(selected))]
+        
+        for idx, fname in selected:
+            img_path = os.path.join(image_dir, fname)
+            mask_path = os.path.join(mask_dir, fname)
+            if os.path.exists(mask_path):
+                selected_images.append(img_path)
+                selected_masks.append(mask_path)
+    
+    print(f"Selected {len(selected_images)} images and {len(selected_masks)} masks")
+    return selected_images, selected_masks
+
+def create_dataset(image_paths, mask_paths):
+    ''' 
+    Create Dataset objects
+    '''
+    x = Dataset.from_dict({"image": image_paths, "label": mask_paths})
+    x = x.cast_column("image", Image())
+    x = x.cast_column("label", Image())
+    return x
+
+def preprocess_mask(mask, target_size=(512, 1000)):
+    ''' 
+    Preprocess annotations to create integer-valued masks
+    '''
+    mask = np.array(mask)
+    # Resize mask to match image size
+    mask_img = Image.fromarray(mask).resize(target_size[::-1], resample=Image.NEAREST)
+    mask = np.array(mask_img)
+    
+    if mask.ndim == 3 and mask.shape[-1] == 4:  # Handle RGBA
+        output_mask = np.zeros(mask.shape[:2], dtype=np.uint8)
+        for color, label in color_map.items():
+            # Compare only RGB channels, ensure alpha=255
+            matches = np.all(mask[..., :3] == color[:3], axis=-1) & (mask[..., 3] == 255)
+            output_mask[matches] = label
+        return output_mask
+    elif mask.ndim == 3 and mask.shape[-1] == 3:  # Handle RGB
+        output_mask = np.zeros(mask.shape[:2], dtype=np.uint8)
+        for color, label in color_map.items():
+            matches = np.all(mask == color[:3], axis=-1)
+            output_mask[matches] = label
+        return output_mask
+    return mask  # If already integer-valued
+
+def preprocess_data(examples):
+    '''
+    Preprocess data
+    '''
+    image_processor = RTDetrImageProcessor.from_pretrained("PekingU/rtdetr_v2_r18vd")
+    target_size = (512, 1000)  # Target size (height, width)
+    images  = []
+    masks   = []
+    
+    for i, (image, mask) in enumerate(zip(examples["image"], examples["label"])):
+        try:
+            # Convert and resize images
+            img = np.array(Image.fromarray(np.array(image)).resize(target_size[::-1], resample=Image.BILINEAR))
+            mask_array = np.array(Image.fromarray(np.array(mask)).resize(target_size[::-1], resample=Image.NEAREST))
+            
+            # Check dimensions
+            if img.shape[:2] != target_size:
+                print(f"Image {i} size mismatch: {img.shape[:2]}, expected {target_size}")
+            if mask_array.shape[:2] != target_size:
+                print(f"Mask {i} size mismatch: {mask_array.shape[:2]}, resized to {target_size}")
+            
+            # Preprocess mask
+            processed_mask = preprocess_mask(mask_array, target_size=target_size)
+            images.append(img)
+            masks.append(processed_mask)
+        except Exception as e:
+            print(f"Error processing pair {i}: {e}")
+            images.append(np.zeros((*target_size, 3), dtype=np.uint8))  # Fallback image
+            masks.append(np.zeros(target_size, dtype=np.uint8))  # Fallback mask
+    
+    # Apply augmentation
+    augmentation = A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.RandomCrop(height=256, width=512, p=0.5),  # Adjusted for resized input size (512, 1000)
+        A.RandomBrightnessContrast(p=0.2),
+    ])
+    augmented = []
+    for img, msk in zip(images, masks):
+        try:
+            aug = augmentation(image=img, mask=msk)
+            augmented.append(aug)
+        except Exception as e:
+            print(f"Augmentation error: {e}")
+            augmented.append({"image": img, "mask": msk})  # Fallback to original
+    
+    images = [aug["image"] for aug in augmented]
+    masks = [aug ["mask"] for aug in augmented]
+    
+    # Process images and masks
+    encoding = image_processor(images, return_tensors="pt", do_normalize=True)
+    encoding["labels"] = torch.tensor(masks, dtype=torch.long)
+    return encoding
+
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    predictions = np.argmax(logits, axis=1)
+    
+    # Compute IoU and Dice
+    iou = metric_iou.compute(predictions=predictions, references=labels, num_labels=num_labels)
+    dice = metric_dice.compute(predictions=predictions, references=labels)
+    
+    # Compute ROC and Precision-Recall curves
+    roc_metrics = {}
+    pr_metrics = {}
+    logits_flat = logits.reshape(-1, num_labels)
+    labels_flat = labels.reshape(-1)
+    probs = torch.softmax(torch.tensor(logits_flat), dim=-1).numpy()
+    
+    for label in range(num_labels):
+        if label in labels_flat:
+            fpr, tpr, _ = roc_curve(labels_flat == label, probs[:, label])
+            roc_auc = auc(fpr, tpr)
+            precision, recall, _ = precision_recall_curve(labels_flat == label, probs[:, label])
+            pr_auc = auc(recall, precision)
+            roc_metrics[f"roc_auc_{id2label[label]}"] = roc_auc
+            pr_metrics[f"pr_auc_{id2label[label]}"] = pr_auc
+            
+            # Plot ROC and PR curves
+            plt.figure(figsize=(10, 5))
+            plt.subplot(1, 2, 1)
+            plt.plot(fpr, tpr, label=f"ROC (AUC = {roc_auc:.2f})")
+            plt.xlabel("FPR")
+            plt.ylabel("TPR")
+            plt.title(f"ROC Curve: {id2label[label]}")
+            plt.legend()
+            
+            plt.subplot(1, 2, 2)
+            plt.plot(recall, precision, label=f"PR (AUC = {pr_auc:.2f})")
+            plt.xlabel("Recall")
+            plt.ylabel("Precision")
+            plt.title(f"Precision-Recall Curve: {id2label[label]}")
+            plt.legend()
+            
+            plt.savefig(f"{output_dir}/{id2label[label]}_curves.png")
+            plt.close()
+    
+    return {
+        "mean_iou": iou["mean_iou"],
+        "dice": dice["dice"],
+        **roc_metrics,
+        **pr_metrics
+    }
+
+def infer_and_visualize(image_path, output_path=None):
+    '''
+    Inference and visualization
+    '''
+    image = Image.open(image_path).convert("RGB")
+    image = np.array(Image.fromarray(np.array(image)).resize((1000, 512), resample=Image.BILINEAR))
+    inputs = image_processor(images=image, return_tensors="pt")
+    model.eval()
+    with torch.no_grad():
+        outputs = model(**inputs)
+    predicted_mask = outputs.logits.argmax(dim=1).squeeze().numpy()
+    
+    # Visualize
+    plt.figure(figsize=(15, 5))
+    plt.subplot(1, 2, 1)
+    plt.imshow(np.array(image), cmap="gray")
+    plt.title("Input OCT Image")
+    plt.axis("off")
+    
+    plt.subplot(1, 2, 2)
+    plt.imshow(predicted_mask, cmap="viridis")
+    plt.title("Predicted Segmentation")
+    plt.axis("off")
+    
+    if output_path:
+        plt.savefig(output_path)
+        plt.close()
+    else:
+        plt.show()
+    
+    return predicted_mask
+
+# %% Sample Dataset 
+image_paths, mask_paths = create_smaller_dataset(image_dir, mask_dir)
+train_images, temp_images, train_masks, temp_masks = train_test_split(
+                                                    image_paths, mask_paths, test_size=0.2, random_state=42)
+val_images, test_images, val_masks, test_masks = train_test_split(
+                                                    temp_images, temp_masks, test_size=0.5, random_state=42)
+
+# %%  Create Datasets
+trn_d  = create_dataset(train_images, train_masks)
+val_d  = create_dataset(val_images, val_masks)
+tst_d  = create_dataset(test_images, test_masks)
+all_d  = DatasetDict({"trn": trn_d, "val": val_d, "tst": tst_d})
+# %% Preprocess Data 
+trn_d   = trn_d.map(preprocess_data, batched=True, remove_columns=["image", "label"])
+val_d   = val_d.map(preprocess_data, batched=True, remove_columns=["image", "label"])
+tst_d   = tst_d.map(preprocess_data, batched=True, remove_columns=["image", "label"])
+
+# %% Class Labels & Colors
+id2label = {0: "background", 1: "ILM", 2: "RPE", 3: "BM"}
+label2id = {v: k for k, v in id2label.items()}
+num_labels = len(id2label)
+
+# Define colors for annotations (RGBA, updated from user output)
+color_map = {
+    (255, 0, 0, 255): 1,    # ILM: Red
+    (0, 0, 252, 255): 2,   # RPE: Blue (252)
+    (0, 0, 193, 255): 3     # BM: Blue (193)
+}
+
+# %% Load model
+model = RTDetrV2ForObjectDetection.from_pretrained("PekingU/rtdetr_v2_r18vd",
+            num_labels=num_labels,
+            id2label=id2label,
+            label2id=label2id,
+            ignore_mismatched_sizes=True
+            )
+
+# %% TRAIN 
+# Define training arguments
+training_args = TrainingArguments(
+    output_dir=output_dir,
+    learning_rate=6e-5,
+    num_train_epochs=10,
+    per_device_train_batch_size=4,  # Adjusted for 4GB GPU
+    per_device_eval_batch_size=4,
+    gradient_accumulation_steps=2,  # To handle small GPU memory
+    evaluation_strategy="epoch",
+    save_strategy="epoch",
+    load_best_model_at_end=True,
+    push_to_hub=False,
+    remove_unused_columns=False
+)
+
+# Initialize Trainer
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    compute_metrics=compute_metrics
+)
+
+# Train the model
+trainer.train()
+# Save the model
+trainer.save_model(f"{output_dir}-final")
+
+# %% 
+# Define metrics
+# metric_iou = load_metric("mean_iou")
+# metric_dice = load_metric("dice")
+
+
+
+# Example usage
+infer_and_visualize("/home/suraj/Data/Duke_WLOA_RL_Annotated/AMD/output/image/AMD_001_045.png", "./segformer-oct-final/sample_prediction.png")
