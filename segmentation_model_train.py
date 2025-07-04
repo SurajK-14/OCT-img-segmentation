@@ -8,11 +8,11 @@ import numpy as np
 from PIL import Image
 from pathlib import Path
 import matplotlib.pyplot as plt
-from datasets import Dataset, DatasetDict, Image
+from datasets import Dataset, DatasetDict, Image as HFImage
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_curve, auc, precision_recall_curve
-from transformers import AutoImageProcessor, TrainingArguments, Trainer, RTDetrV2ForObjectDetection, RTDetrImageProcessor
-import albumentations as A
+from transformers import TrainingArguments, Trainer, SegformerForSemanticSegmentation, RTDetrImageProcessor
+# import albumentations as A
 # from evaluate import load as load_metric
 
 # %% SESSION VARIABLES
@@ -90,8 +90,8 @@ def create_dataset(image_paths, mask_paths)-> Dataset:
         Dataset: A Hugging Face Dataset object containing images and masks.
     '''
     x = Dataset.from_dict({"image": image_paths, "label": mask_paths})
-    x = x.cast_column("image", Image())
-    x = x.cast_column("label", Image())
+    x = x.cast_column("image", HFImage())
+    x = x.cast_column("label", HFImage())
     return x
 
 def preprocess_mask(mask, target_size=(512, 1000)):
@@ -119,59 +119,35 @@ def preprocess_mask(mask, target_size=(512, 1000)):
     return mask  # If already integer-valued
 
 def preprocess_data(examples):
-    '''
-    Preprocess data
-    '''
     image_processor = RTDetrImageProcessor.from_pretrained("PekingU/rtdetr_v2_r18vd")
-    target_size = (512, 1000)  # Target size (height, width)
-    images  = []
-    masks   = []
-    
+    target_size = (512, 512)
+    images, masks = [], []
+
     for i, (image, mask) in enumerate(zip(examples["image"], examples["label"])):
         try:
-            # Convert and resize images
-            img = np.array(Image.fromarray(np.array(image)).resize(target_size[::-1], resample=Image.BILINEAR))
-            mask_array = np.array(Image.fromarray(np.array(mask)).resize(target_size[::-1], resample=Image.NEAREST))
-            
-            # Check dimensions
-            if img.shape[:2] != target_size:
-                print(f"Image {i} size mismatch: {img.shape[:2]}, expected {target_size}")
-            if mask_array.shape[:2] != target_size:
-                print(f"Mask {i} size mismatch: {mask_array.shape[:2]}, resized to {target_size}")
-            
-            # Preprocess mask
-            processed_mask = preprocess_mask(mask_array, target_size=target_size)
+            # Always convert to RGB before resizing
+            img_pil = Image.fromarray(np.array(image)).convert("RGB").resize(target_size[::-1], resample=Image.BILINEAR)
+            img = np.array(img_pil)
+            msk = np.array(Image.fromarray(np.array(mask)).resize(target_size[::-1], resample=Image.NEAREST))
+            processed_mask = preprocess_mask(msk, target_size=target_size)
             images.append(img)
             masks.append(processed_mask)
         except Exception as e:
             print(f"Error processing pair {i}: {e}")
-            images.append(np.zeros((*target_size, 3), dtype=np.uint8))  # Fallback image
-            masks.append(np.zeros(target_size, dtype=np.uint8))  # Fallback mask
-    
-    # Apply augmentation
-    augmentation = A.Compose([
-        A.HorizontalFlip(p=0.5),
-        A.RandomCrop(height=256, width=512, p=0.5),  # Adjusted for resized input size (512, 1000)
-        A.RandomBrightnessContrast(p=0.2),
-    ])
-    augmented = []
-    for img, msk in zip(images, masks):
-        try:
-            aug = augmentation(image=img, mask=msk)
-            augmented.append(aug)
-        except Exception as e:
-            print(f"Augmentation error: {e}")
-            augmented.append({"image": img, "mask": msk})  # Fallback to original
-    
-    images = [aug["image"] for aug in augmented]
-    masks = [aug ["mask"] for aug in augmented]
-    
-    # Process images and masks
+            images.append(np.zeros((*target_size, 3), dtype=np.uint8))
+            masks.append(np.zeros(target_size, dtype=np.uint8))
+
     encoding = image_processor(images, return_tensors="pt", do_normalize=True)
-    encoding["labels"] = torch.tensor(masks, dtype=torch.long)
+    #encoding["labels"] = torch.tensor(masks, dtype=torch.long)
+    encoding["labels"] = torch.tensor(np.array(masks), dtype=torch.long)
     return encoding
 
 def compute_metrics(eval_pred):
+    '''
+    Compute evaluation metrics including IoU, Dice, ROC AUC, and Precision-Recall AUC.
+    Args:
+        
+        '''
     logits, labels = eval_pred
     predictions = np.argmax(logits, axis=1)
     
@@ -253,24 +229,8 @@ def infer_and_visualize(image_path, output_path=None):
     
     return predicted_mask
 
-# %% Sample Dataset 
-image_paths, mask_paths = create_smaller_dataset(image_dir, mask_dir)
-train_images, temp_images, train_masks, temp_masks = train_test_split(
-                                                    image_paths, mask_paths, test_size=0.2, random_state=42)
-val_images, test_images, val_masks, test_masks = train_test_split(
-                                                    temp_images, temp_masks, test_size=0.5, random_state=42)
 
-# %%  Create Datasets
-trn_d  = create_dataset(train_images, train_masks)
-val_d  = create_dataset(val_images, val_masks)
-tst_d  = create_dataset(test_images, test_masks)
-all_d  = DatasetDict({"trn": trn_d, "val": val_d, "tst": tst_d})
-# %% Preprocess Data 
-trn_d   = trn_d.map(preprocess_data, batched=True, remove_columns=["image", "label"])
-val_d   = val_d.map(preprocess_data, batched=True, remove_columns=["image", "label"])
-tst_d   = tst_d.map(preprocess_data, batched=True, remove_columns=["image", "label"])
-
-# %% Class Labels & Colors
+#%% Class Labels & Colors
 id2label = {0: "background", 1: "ILM", 2: "RPE", 3: "BM"}
 label2id = {v: k for k, v in id2label.items()}
 num_labels = len(id2label)
@@ -278,54 +238,160 @@ num_labels = len(id2label)
 # Define colors for annotations (RGBA, updated from user output)
 color_map = {
     (255, 0, 0, 255): 1,    # ILM: Red
-    (0, 0, 252, 255): 2,   # RPE: Blue (252)
+    (0, 0, 252, 255): 2,   # RPE:  Blue (252)
     (0, 0, 193, 255): 3     # BM: Blue (193)
 }
 
+
+
+
+########
+# %% Sample Dataset 
+image_paths, mask_paths = create_smaller_dataset(image_dir, mask_dir)
+# limiting to 300 images for testing
+image_paths = image_paths[:300]
+mask_paths = mask_paths[:300]
+
+# %% Split Dataset
+train_images, temp_images, train_masks, temp_masks = train_test_split(
+                                                    image_paths, mask_paths, test_size=0.2, random_state=42)
+val_images, test_images, val_masks, test_masks = train_test_split(
+                                                    temp_images, temp_masks, test_size=0.5, random_state=42)
+
+
+
+# %%  Create Datasets
+trn_d  = create_dataset(train_images, train_masks)
+val_d  = create_dataset(val_images, val_masks)
+tst_d  = create_dataset(test_images, test_masks)
+all_d  = DatasetDict({"trn": trn_d, "val": val_d, "tst": tst_d})
+
+
+
+# %% Preprocess Data 
+trn_d   = trn_d.map(preprocess_data, batched=True, remove_columns=["image", "label"])
+val_d   = val_d.map(preprocess_data, batched=True, remove_columns=["image", "label"])
+tst_d   = tst_d.map(preprocess_data, batched=True, remove_columns=["image", "label"])
+
+
 # %% Load model
-model = RTDetrV2ForObjectDetection.from_pretrained("PekingU/rtdetr_v2_r18vd",
+model = SegformerForSemanticSegmentation.from_pretrained("PekingU/rtdetr_v2_r18vd",
             num_labels=num_labels,
             id2label=id2label,
             label2id=label2id,
             ignore_mismatched_sizes=True
             )
 
-# %% TRAIN 
-# Define training arguments
+# %% Training Setup
 training_args = TrainingArguments(
     output_dir=output_dir,
     learning_rate=6e-5,
-    num_train_epochs=10,
-    per_device_train_batch_size=4,  # Adjusted for 4GB GPU
+    num_train_epochs=5,
+    per_device_train_batch_size=4,
     per_device_eval_batch_size=4,
-    gradient_accumulation_steps=2,  # To handle small GPU memory
-    evaluation_strategy="epoch",
-    save_strategy="epoch",
-    load_best_model_at_end=True,
+    gradient_accumulation_steps=2,
     push_to_hub=False,
     remove_unused_columns=False
 )
 
-# Initialize Trainer
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=val_dataset,
+    train_dataset=trn_d,
+    eval_dataset=val_d,
     compute_metrics=compute_metrics
 )
 
-# Train the model
+# %% Train the model
 trainer.train()
-# Save the model
 trainer.save_model(f"{output_dir}-final")
 
-# %% 
-# Define metrics
-# metric_iou = load_metric("mean_iou")
-# metric_dice = load_metric("dice")
+# %%
+plt.savefig(f"{output_dir}/{id2label[label]}_curves.png")
+
+# %% Define metrics
+ #metric_iou = load_metric("mean_iou")
+ #metric_dice = load_metric("dice")
+ print({
+    "mean_iou": iou["mean_iou"],
+    "dice": dice["dice"],
+    **roc_metrics,
+    **pr_metrics
+})
 
 
-
-# Example usage
+# %% Example usage
 infer_and_visualize("/home/suraj/Data/Duke_WLOA_RL_Annotated/AMD/output/image/AMD_001_045.png", "./segformer-oct-final/sample_prediction.png")
+
+
+'''
+# %% MAIN
+def main():
+    
+    # Sample Dataset 
+    image_paths, mask_paths = create_smaller_dataset(image_dir, mask_dir)
+    # limiting to 300 images for testing
+    image_paths = image_paths[:300]
+    mask_paths = mask_paths[:300]
+
+    # Split Dataset
+    train_images, temp_images, train_masks, temp_masks = train_test_split(
+                                                        image_paths, mask_paths, test_size=0.2, random_state=42)
+    val_images, test_images, val_masks, test_masks = train_test_split(
+                                                        temp_images, temp_masks, test_size=0.5, random_state=42)
+
+
+    # Create Datasets
+    trn_d  = create_dataset(train_images, train_masks)
+    val_d  = create_dataset(val_images, val_masks)
+    tst_d  = create_dataset(test_images, test_masks)
+    all_d  = DatasetDict({"trn": trn_d, "val": val_d, "tst": tst_d})
+
+
+
+    # Preprocess Data 
+    trn_d   = trn_d.map(preprocess_data, batched=True, remove_columns=["image", "label"])
+    val_d   = val_d.map(preprocess_data, batched=True, remove_columns=["image", "label"])
+    tst_d   = tst_d.map(preprocess_data, batched=True, remove_columns=["image", "label"])
+
+
+    # Load model
+    model = SegformerForSemanticSegmentation.from_pretrained("PekingU/rtdetr_v2_r18vd",
+                num_labels=num_labels,
+                id2label=id2label,
+                label2id=label2id,
+                ignore_mismatched_sizes=True
+                )
+    
+        # %% Training Setup
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        learning_rate=6e-5,
+        num_train_epochs=5,
+        per_device_train_batch_size=4,
+        per_device_eval_batch_size=4,
+        gradient_accumulation_steps=2,
+        push_to_hub=False,
+        remove_unused_columns=False
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=trn_d,
+        eval_dataset=val_d,
+        compute_metrics=compute_metrics
+    )
+
+    # %% Train the model
+    trainer.train()
+    trainer.save_model(f"{output_dir}-final")
+    return None
+    
+    
+if __name__ == "__main__":
+    main()
+    
+    '''
+    
+## CHANGELOG
